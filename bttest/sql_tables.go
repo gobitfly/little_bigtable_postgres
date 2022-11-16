@@ -1,21 +1,20 @@
 package bttest
 
 import (
-	"bytes"
 	"database/sql"
-	"encoding/gob"
 	"fmt"
-	"log"
 
-	"github.com/mattn/go-sqlite3"
+	"github.com/jmoiron/sqlx"
+	"github.com/sirupsen/logrus"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // SqlTables persists tables to tables_t
 type SqlTables struct {
-	db *sql.DB
+	db *sqlx.DB
 }
 
-func NewSqlTables(db *sql.DB) *SqlTables {
+func NewSqlTables(db *sqlx.DB) *SqlTables {
 	return &SqlTables{
 		db: db,
 	}
@@ -30,8 +29,11 @@ func (t *table) Scan(src interface{}) error {
 		return fmt.Errorf("unknown type %T", src)
 	}
 
-	b := bytes.NewBuffer(src.([]byte))
-	err := gob.NewDecoder(b).Decode(&t.families)
+	err := msgpack.Unmarshal(src.([]byte), &t.families)
+
+	if err != nil {
+		return err
+	}
 
 	t.counter = uint64(len(t.families))
 	for _, f := range t.families {
@@ -46,9 +48,7 @@ func (t *table) Bytes() ([]byte, error) {
 	if t == nil {
 		return nil, nil
 	}
-	b := new(bytes.Buffer)
-	err := gob.NewEncoder(b).Encode(t.families)
-	return b.Bytes(), err
+	return msgpack.Marshal(&t.families)
 }
 
 func (db *SqlTables) Get(parent, tableId string) *table {
@@ -57,7 +57,7 @@ func (db *SqlTables) Get(parent, tableId string) *table {
 		tableId: tableId,
 		rows:    NewSqlRows(db.db, parent, tableId),
 	}
-	err := db.db.QueryRow("SELECT metadata FROM tables_t WHERE parent = ? AND table_id = ?", parent, tableId).Scan(tbl)
+	err := db.db.QueryRow("SELECT metadata FROM tables_t WHERE parent = $1 AND table_id = $2", parent, tableId).Scan(tbl)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -72,19 +72,19 @@ func (db *SqlTables) GetAll() []*table {
 		return nil
 	}
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatalf("SqlTables GetAll: %v", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		t := table{}
 		if err := rows.Scan(&t.parent, &t.tableId, &t); err != nil {
-			log.Fatal(err)
+			logrus.Fatalf("SqlTables GetAll Scan: %v", err)
 		}
 		t.rows = NewSqlRows(db.db, t.parent, t.tableId)
 		tables = append(tables, &t)
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatal(err)
+		logrus.Fatalf("SqlTables GetAll Err: %v", err)
 	}
 	return tables
 }
@@ -92,20 +92,17 @@ func (db *SqlTables) GetAll() []*table {
 func (db *SqlTables) Save(t *table) {
 	metadata, err := t.Bytes()
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatal(err)
 	}
-	_, err = db.db.Exec("INSERT INTO tables_t (parent, table_id, metadata) VALUES (?, ?, ?)", t.parent, t.tableId, metadata)
-	if e, ok := err.(sqlite3.Error); ok && e.Code == 19 {
-		_, err = db.db.Exec("UPDATE tables_t SET metadata = ? WHERE parent = ? AND table_id = ?", metadata, t.parent, t.tableId)
-	}
+	_, err = db.db.Exec("INSERT INTO tables_t (parent, table_id, metadata) VALUES ($1, $2, $3) ON CONFLICT (parent, table_id) DO UPDATE SET metadata = EXCLUDED.metadata", t.parent, t.tableId, metadata)
 	if err != nil {
-		log.Fatalf("%#v", err)
+		logrus.Fatalf("SqlTables Save: %v", err)
 	}
 }
 
 func (db *SqlTables) Delete(t *table) {
-	_, err := db.db.Exec("DELETE FROM tables_t WHERE parent = ? AND table_id = ? ", t.parent, t.tableId)
+	_, err := db.db.Exec("DELETE FROM tables_t WHERE parent = $1 AND table_id = $2 ", t.parent, t.tableId)
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatalf("SqlTables Delete: %v", err)
 	}
 }

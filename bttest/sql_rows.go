@@ -1,15 +1,16 @@
 package bttest
 
 import (
-	"bytes"
 	"database/sql"
-	"encoding/gob"
 	"fmt"
-	"log"
 	"sync"
+	"time"
+
+	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/google/btree"
-	"github.com/mattn/go-sqlite3"
+	"github.com/jmoiron/sqlx"
+	"github.com/sirupsen/logrus"
 )
 
 // SqlRows is a backend modeled on the github.com/google/btree interface
@@ -21,10 +22,10 @@ type SqlRows struct {
 	tableId string // The name by which the new table should be referred to within the parent instance
 
 	mu sync.RWMutex
-	db *sql.DB
+	db *sqlx.DB
 }
 
-func NewSqlRows(db *sql.DB, parent, tableId string) *SqlRows {
+func NewSqlRows(db *sqlx.DB, parent, tableId string) *SqlRows {
 	return &SqlRows{
 		parent:  parent,
 		tableId: tableId,
@@ -40,17 +41,13 @@ func (r *row) Scan(src interface{}) error {
 	default:
 		return fmt.Errorf("unknown type %T", src)
 	}
-
-	b := bytes.NewBuffer(src.([]byte))
-	return gob.NewDecoder(b).Decode(&r.families)
+	return msgpack.Unmarshal(src.([]byte), &r.families)
 }
 func (r *row) Bytes() ([]byte, error) {
 	if r == nil {
 		return nil, nil
 	}
-	b := new(bytes.Buffer)
-	err := gob.NewEncoder(b).Encode(r.families)
-	return b.Bytes(), err
+	return msgpack.Marshal(&r.families)
 }
 
 type ItemIterator = btree.ItemIterator
@@ -64,49 +61,83 @@ func (db *SqlRows) query(iterator ItemIterator, query string, args ...interface{
 		return
 	}
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatal(err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var r row
 		if err := rows.Scan(&r.key, &r); err != nil {
-			log.Fatal(err)
+			logrus.Fatal(err)
 		}
 		if !iterator(&r) {
 			break
 		}
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatal(err)
+		logrus.Fatal(err)
 	}
 }
 
 func (db *SqlRows) Ascend(iterator ItemIterator) {
-	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = ? and table_id = ? ORDER BY row_key ASC", db.parent, db.tableId)
+	start := time.Now()
+	logrus.Infof("Ascend for table %s/%s", db.parent, db.tableId)
+	defer func() {
+		logrus.Infof("Ascend for table %s/%s completed in %v", db.parent, db.tableId, time.Since(start))
+	}()
+
+	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 ORDER BY row_key ASC", db.parent, db.tableId)
 }
 
 func (db *SqlRows) AscendGreaterOrEqual(pivot Item, iterator ItemIterator) {
 	row := pivot.(*row)
-	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = ? and table_id = ? and row_key >= ? ORDER BY row_key ASC", db.parent, db.tableId, row.key)
+
+	start := time.Now()
+	logrus.Infof("AscendGreaterOrEqual for %s of table %s/%s", row.key, db.parent, db.tableId)
+	defer func() {
+		logrus.Infof("AscendGreaterOrEqual for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
+	}()
+
+	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key >= $3 ORDER BY row_key ASC", db.parent, db.tableId, row.key)
 }
 
 func (db *SqlRows) AscendLessThan(pivot Item, iterator ItemIterator) {
 	row := pivot.(*row)
-	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = ? and table_id = ? and row_key < ? ORDER BY row_key ASC", db.parent, db.tableId, row.key)
+
+	start := time.Now()
+	logrus.Infof("AscendLessThan for %s of table %s/%s", row.key, db.parent, db.tableId)
+	defer func() {
+		logrus.Infof("AscendLessThan for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
+	}()
+
+	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key < $3 ORDER BY row_key ASC", db.parent, db.tableId, row.key)
 }
 
 func (db *SqlRows) AscendRange(greaterOrEqual, lessThan Item, iterator ItemIterator) {
 	ge := greaterOrEqual.(*row)
 	lt := lessThan.(*row)
-	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = ? and table_id = ? and row_key >= ? and row_key < ? ORDER BY row_key ASC", db.parent, db.tableId, ge.key, lt.key)
+
+	start := time.Now()
+	logrus.Infof("AscendRange for %s/%s of table %s/%s", ge.key, lt.key, db.parent, db.tableId)
+	defer func() {
+		logrus.Infof("AscendRange for %s/%s of table %s/%s completed in %v", ge.key, lt.key, db.parent, db.tableId, time.Since(start))
+	}()
+
+	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key >= $3 and row_key < $4 ORDER BY row_key ASC", db.parent, db.tableId, ge.key, lt.key)
 }
 
 func (db *SqlRows) DeleteAll() {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.db.Exec("DELETE FROM rows_t WHERE parent = ? and table_id = ?", db.parent, db.tableId)
+
+	start := time.Now()
+	logrus.Infof("DeleteAll for table %s/%s", db.parent, db.tableId)
+	defer func() {
+		logrus.Infof("DeleteAll for table %s/%s completed in %v", db.parent, db.tableId, time.Since(start))
+	}()
+
+	_, err := db.db.Exec("DELETE FROM rows_t WHERE parent = $1 and table_id = $2", db.parent, db.tableId)
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatal(err)
 	}
 
 }
@@ -115,9 +146,16 @@ func (db *SqlRows) Delete(item Item) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	row := item.(*row)
-	_, err := db.db.Exec("DELETE FROM rows_t WHERE parent = ? and table_id = ? and row_key = ?", db.parent, db.tableId, row.key)
+
+	start := time.Now()
+	logrus.Infof("Delete for %s of table %s/%s", row.key, db.parent, db.tableId)
+	defer func() {
+		logrus.Infof("Delete for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
+	}()
+
+	_, err := db.db.Exec("DELETE FROM rows_t WHERE parent = $1 and table_id = $2 and row_key = $3", db.parent, db.tableId, row.key)
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatal(err)
 	}
 }
 
@@ -128,12 +166,19 @@ func (db *SqlRows) Get(key Item) Item {
 	}
 	// db.mu.RLock()
 	// defer db.mu.RUnlock()
-	err := db.db.QueryRow("SELECT families FROM rows_t WHERE parent = ? and table_id = ? and row_key = ?", db.parent, db.tableId, row.key).Scan(row)
+
+	start := time.Now()
+	logrus.Infof("Get for %s of table %s/%s", row.key, db.parent, db.tableId)
+	defer func() {
+		logrus.Infof("Get for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
+	}()
+
+	err := db.db.QueryRow("SELECT families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key = $3", db.parent, db.tableId, row.key).Scan(row)
 	if err == sql.ErrNoRows {
 		return row
 	}
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatal(err)
 	}
 	return row
 }
@@ -142,9 +187,16 @@ func (db *SqlRows) Len() int {
 	var count int
 	// db.mu.RLock()
 	// defer db.mu.RUnlock()
-	err := db.db.QueryRow("SELECT count(*) FROM rows_t WHERE parent = ? and table_id = ?", db.parent, db.tableId).Scan(&count)
+
+	start := time.Now()
+	logrus.Infof("Len for table %s/%s", db.parent, db.tableId)
+	defer func() {
+		logrus.Infof("Len for table %s/%s completed in %v", db.parent, db.tableId, time.Since(start))
+	}()
+
+	err := db.db.QueryRow("SELECT count(*) FROM rows_t WHERE parent = $1 and table_id = $2", db.parent, db.tableId).Scan(&count)
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatal(err)
 	}
 	return count
 }
@@ -153,17 +205,20 @@ func (db *SqlRows) ReplaceOrInsert(item Item) Item {
 	row := item.(*row)
 	families, err := row.Bytes()
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatal(err)
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	_, err = db.db.Exec("INSERT INTO rows_t (parent, table_id, row_key, families) values (?, ?, ?, ?)", db.parent, db.tableId, row.key, families)
-	if e, ok := err.(sqlite3.Error); ok && e.Code == 19 {
-		_, err = db.db.Exec("UPDATE rows_t SET families = ? WHERE parent = ? AND table_id = ? AND row_key = ?", families, db.parent, db.tableId, row.key)
-	}
+	start := time.Now()
+	logrus.Infof("ReplaceOrInsert for %s of table %s/%s", row.key, db.parent, db.tableId)
+	defer func() {
+		logrus.Infof("ReplaceOrInsert for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
+	}()
+
+	_, err = db.db.Exec("INSERT INTO rows_t (parent, table_id, row_key, families) values ($1, $2, $3, $4) ON CONFLICT (parent, table_id, row_key) DO UPDATE SET families = EXCLUDED.families", db.parent, db.tableId, row.key, families)
 	if err != nil {
-		log.Fatalf("row:%s err %s", row.key, err)
+		logrus.Fatalf("row:%s err %s", row.key, err)
 	}
 	return row
 }

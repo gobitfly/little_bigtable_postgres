@@ -19,6 +19,7 @@ Package bttest contains test helpers for working with the bigtable package.
 
 To use a Server, create it, and then connect to it with no security:
 (The project/instance values are ignored.)
+
 	srv, err := bttest.NewServer("localhost:0")
 	...
 	conn, err := grpc.Dial(srv.Addr, grpc.WithInsecure())
@@ -32,11 +33,8 @@ package bttest // import "cloud.google.com/go/bigtable/bttest"
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/binary"
-	"encoding/gob"
 	"fmt"
-	"log"
 	"math"
 	"math/rand"
 	"net"
@@ -49,6 +47,8 @@ import (
 	emptypb "github.com/golang/protobuf/ptypes/empty"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/google/btree"
+	"github.com/jmoiron/sqlx"
+	"github.com/sirupsen/logrus"
 	btapb "google.golang.org/genproto/googleapis/bigtable/admin/v2"
 	btpb "google.golang.org/genproto/googleapis/bigtable/v2"
 	"google.golang.org/genproto/googleapis/longrunning"
@@ -89,7 +89,7 @@ type server struct {
 	tables       map[string]*table          // keyed by fully qualified name
 	instances    map[string]*btapb.Instance // keyed by fully qualified name
 	gcc          chan int                   // set when gcloop starts, closed when server shuts down
-	db           *sql.DB
+	db           *sqlx.DB
 	tableBackend *SqlTables
 
 	// Any unimplemented methods will cause a panic.
@@ -101,7 +101,7 @@ type server struct {
 // NewServer creates a new Server.
 // The Server will be listening for gRPC connections, without TLS,
 // on the provided address. The resolved address is named by the Addr field.
-func NewServer(laddr string, db *sql.DB, opt ...grpc.ServerOption) (*Server, error) {
+func NewServer(laddr string, db *sqlx.DB, opt ...grpc.ServerOption) (*Server, error) {
 	l, err := net.Listen("tcp", laddr)
 	if err != nil {
 		return nil, err
@@ -371,7 +371,7 @@ func (s *server) ReadRows(req *btpb.ReadRowsRequest, stream btpb.Bigtable_ReadRo
 	tbl.mu.RLock()
 	rowSet := make(map[string]*row)
 	families := make(map[string]bool)
-	for f, _ := range tbl.families {
+	for f := range tbl.families {
 		families[f] = true
 	}
 
@@ -429,7 +429,7 @@ func (s *server) ReadRows(req *btpb.ReadRowsRequest, stream btpb.Bigtable_ReadRo
 		// JIT per-row GC
 		changed := r.gc(gcRules)
 		// JIT family deletion
-		for f, _ := range r.families {
+		for f := range r.families {
 			if !families[f] {
 				delete(r.families, f)
 				changed = true
@@ -729,7 +729,7 @@ func includeCell(f *btpb.RowFilter, fam, col string, cell cell) (bool, error) {
 		// Don't log, cell-modifying filter
 		return true, nil
 	default:
-		log.Printf("WARNING: don't know how to handle filter of type %T (ignoring it)", f)
+		logrus.Printf("WARNING: don't know how to handle filter of type %T (ignoring it)", f)
 		return true, nil
 	case *btpb.RowFilter_FamilyNameRegexFilter:
 		rx, err := newRegexp([]byte(f.FamilyNameRegexFilter))
@@ -830,7 +830,7 @@ func escapeUTF(in []byte) []byte {
 func newRegexp(pat []byte) (*binaryregexp.Regexp, error) {
 	re, err := binaryregexp.Compile("^(?:" + string(escapeUTF(pat)) + ")$") // match entire target
 	if err != nil {
-		log.Printf("Bad pattern %q: %v", pat, err)
+		logrus.Printf("Bad pattern %q: %v", pat, err)
 	}
 	return re, err
 }
@@ -856,7 +856,7 @@ func (s *server) MutateRow(ctx context.Context, req *btpb.MutateRowRequest) (*bt
 	// JIT per-row GC
 	r.gc(tbl.gcRules())
 	// JIT family deletion
-	for f, _ := range r.families {
+	for f := range r.families {
 		if _, ok := fs[f]; !ok {
 			delete(r.families, f)
 		}
@@ -900,7 +900,7 @@ func (s *server) MutateRows(req *btpb.MutateRowsRequest, stream btpb.Bigtable_Mu
 		}
 		r.gc(tbl.gcRules())
 		// JIT family deletion; could be skipped if mutableRow doesn't return an existing row
-		for f, _ := range r.families {
+		for f := range r.families {
 			if _, ok := cfs[f]; !ok {
 				delete(r.families, f)
 			}
@@ -950,7 +950,7 @@ func (s *server) CheckAndMutateRow(ctx context.Context, req *btpb.CheckAndMutate
 	}
 	r.gc(tbl.gcRules())
 	// JIT family deletion; could be skipped if mutableRow doesn't return an existing row
-	for f, _ := range r.families {
+	for f := range r.families {
 		if _, ok := cfs[f]; !ok {
 			delete(r.families, f)
 		}
@@ -1145,7 +1145,7 @@ func (s *server) ReadModifyWriteRow(ctx context.Context, req *btpb.ReadModifyWri
 	}
 	r.gc(tbl.gcRules())
 	// JIT family deletion; could be skipped if mutableRow doesn't return an existing row
-	for f, _ := range r.families {
+	for f := range r.families {
 		if _, ok := cfs[f]; !ok {
 			delete(r.families, f)
 		}
@@ -1224,9 +1224,7 @@ type table struct {
 	rows     *SqlRows                 // indexed by row key
 }
 
-const btreeDegree = 16
-
-func newTable(ctr *btapb.CreateTableRequest, db *sql.DB) *table {
+func newTable(ctr *btapb.CreateTableRequest, db *sqlx.DB) *table {
 	fams := make(map[string]*columnFamily)
 	c := uint64(0)
 	if ctr.Table != nil {
@@ -1421,10 +1419,10 @@ func (r *row) String() string {
 var gcTypeWarn sync.Once
 
 func init() {
-	gob.Register(&btapb.GcRule_Intersection_{})
-	gob.Register(&btapb.GcRule_Union_{})
-	gob.Register(&btapb.GcRule_MaxAge{})
-	gob.Register(&btapb.GcRule_MaxNumVersions{})
+	// gob.Register(&btapb.GcRule_Intersection_{})
+	// gob.Register(&btapb.GcRule_Union_{})
+	// gob.Register(&btapb.GcRule_MaxAge{})
+	// gob.Register(&btapb.GcRule_MaxNumVersions{})
 }
 
 // applyGC applies the given GC rule to the cells.
@@ -1433,7 +1431,7 @@ func applyGC(cells []cell, rule *btapb.GcRule) ([]cell, bool) {
 	default:
 		// TODO(dsymonds): Support GcRule_Intersection_
 		gcTypeWarn.Do(func() {
-			log.Printf("Unsupported GC rule type %T", rule)
+			logrus.Printf("Unsupported GC rule type %T", rule)
 		})
 	case *btapb.GcRule_Union_:
 		var changed bool
@@ -1454,7 +1452,7 @@ func applyGC(cells []cell, rule *btapb.GcRule) ([]cell, bool) {
 		// This sort.Search will return the index of the first cell whose timestamp is chronologically before the cutoff.
 		si := sort.Search(len(cells), func(i int) bool { return cells[i].Ts < cutoff })
 		if si < len(cells) {
-			log.Printf("bttest: GC MaxAge(%v) deleted %d cells.", rule.MaxAge, len(cells)-si)
+			logrus.Printf("bttest: GC MaxAge(%v) deleted %d cells.", rule.MaxAge, len(cells)-si)
 			return cells[:si], true
 		}
 		return cells, false

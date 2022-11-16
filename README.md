@@ -2,13 +2,13 @@
 
 ![CI Status](https://github.com/bitly/little_bigtable/actions/workflows/test.yaml/badge.svg?branch=master)
 
-A local emulator for [Cloud Bigtable](https://cloud.google.com/bigtable) with persistence to a sqlite3 backend.
+A local emulator for [Cloud Bigtable](https://cloud.google.com/bigtable) with persistence to a postgres backend.
 
 The Cloud SDK provided `cbtemulator` is in-memory and does not support persistence which limits it's applicability. This project is a fork of `cbtemulator` from [google-cloud-go/bigtable/bttest](https://github.com/googleapis/google-cloud-go/tree/c46c1c395b5f2fb89776a2d0e478e39a2d5572e4/bigtable/bttest)
 
 | | [`cbtemulator`](https://cloud.google.com/bigtable/docs/emulator) | "little" Bigtable | Bigtable
 | --- | ----- | ---- | ----
-| **Storage** | In-Memory | sqlite3 | Distributed GFS
+| **Storage** | In-Memory | Postgres | Distributed GFS
 | **Type** | Emulator | Emulator | Managed Production Datastore
 | **Scaling**| Single process | Single process | Scalable multi-node backend
 | **GC** | async GC | per-row GC at read time |
